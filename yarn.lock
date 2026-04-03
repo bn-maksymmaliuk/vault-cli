@@ -648,7 +648,7 @@ __metadata:
     typescript: "npm:^5.6.2"
     typescript-eslint: "npm:^8.57.2"
   bin:
-    vault-cli: dist/cli.js
+    vault-cli: ./dist/cli.js
   languageName: unknown
   linkType: soft
 
