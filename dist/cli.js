@@ -104,12 +104,12 @@ async function exchangeGithubToken(addr, githubToken) {
       } else if (err.message) {
         errorMessage += `: ${err.message}`;
       }
-      throw new Error(errorMessage);
+      throw new Error(errorMessage, { cause: err });
     }
     if (err instanceof Error) {
-      throw new Error(`GitHub auth failed: ${err.message}`);
+      throw new Error(`GitHub auth failed: ${err.message}`, { cause: err });
     }
-    throw new Error("GitHub auth failed: unknown error");
+    throw new Error("GitHub auth failed: unknown error", { cause: err });
   }
 }
 
@@ -123,7 +123,8 @@ function validateVaultUrl(url) {
     }
   } catch (err) {
     throw new Error(
-      `Invalid VAULT_ADDR: "${url}" - ${err instanceof Error ? err.message : "Invalid URL format"}`
+      `Invalid VAULT_ADDR: "${url}" - ${err instanceof Error ? err.message : "Invalid URL format"}`,
+      { cause: err }
     );
   }
 }
@@ -215,7 +216,6 @@ var VaultClient = class {
   constructor(addr, token) {
     this.addr = addr;
     this.token = token;
-    this.kvVersionCache = /* @__PURE__ */ new Map();
     this.client = import_axios2.default.create({
       baseURL: `${addr}/v1`,
       headers: {
@@ -223,6 +223,8 @@ var VaultClient = class {
       }
     });
   }
+  client;
+  kvVersionCache = /* @__PURE__ */ new Map();
   /**
    * Determines KV version via sys/mounts API.
    * Falls back to probing both KV versions if sys/mounts is not accessible (403).
@@ -309,7 +311,8 @@ var VaultClient = class {
           const value = await this.getSecretV2(v2Path, key);
           if (typeof value !== "string") {
             throw new Error(
-              `Key "${key}" value is not a string at path: ${secretPath} (got ${typeof value})`
+              `Key "${key}" value is not a string at path: ${secretPath} (got ${typeof value})`,
+              { cause: v1Err }
             );
           }
           this.kvVersionCache.set(mount, "v2");
@@ -320,7 +323,7 @@ var VaultClient = class {
       }
     } catch (err) {
       if (err instanceof Error) {
-        throw new Error(`Failed to fetch secret "${secretPath}" with key "${key}": ${err.message}`);
+        throw new Error(`Failed to fetch secret "${secretPath}" with key "${key}": ${err.message}`, { cause: err });
       }
       throw err;
     }
@@ -343,10 +346,10 @@ var VaultClient = class {
     } catch (err) {
       if (import_axios2.default.isAxiosError(err)) {
         if (err.response?.status === 404) {
-          throw new Error(`Secret not found at path: ${basePath}`);
+          throw new Error(`Secret not found at path: ${basePath}`, { cause: err });
         }
         if (err.response?.status === 403) {
-          throw new Error(`Permission denied accessing: ${basePath}`);
+          throw new Error(`Permission denied accessing: ${basePath}`, { cause: err });
         }
       }
       throw err;
@@ -370,10 +373,10 @@ var VaultClient = class {
     } catch (err) {
       if (import_axios2.default.isAxiosError(err)) {
         if (err.response?.status === 404) {
-          throw new Error(`Secret not found at path: ${basePath}`);
+          throw new Error(`Secret not found at path: ${basePath}`, { cause: err });
         }
         if (err.response?.status === 403) {
-          throw new Error(`Permission denied accessing: ${basePath}`);
+          throw new Error(`Permission denied accessing: ${basePath}`, { cause: err });
         }
       }
       throw err;
@@ -484,7 +487,7 @@ async function generateEnv(options) {
           const fullMsg = `Failed to load secret for key "${entry.key}": ${errorMsg}`;
           log.secretFail(entry.key, entry.path, errorMsg);
           errors.push(fullMsg);
-          throw new Error(fullMsg);
+          throw new Error(fullMsg, { cause: err });
         }
       })
     )
@@ -495,7 +498,7 @@ async function generateEnv(options) {
 
 // src/cli.ts
 var program = new import_commander.Command();
-program.name("vault-cli").description("Generate .env from Vault").version("1.1.14");
+program.name("vault-cli").description("Generate .env from Vault").version("1.0.0");
 program.command("env").option("--addr <addr>").option("--token <token>").option("--github-token <token>").option("-o, --output <path>", ".env").option("--verbose", "Enable verbose output for debugging").action(async (opts) => {
   const verbose = opts.verbose;
   try {
@@ -538,7 +541,8 @@ Expected file like: .env.${env}.tpl in project root`
         import_fs2.default.mkdirSync(dir, { recursive: true });
       } catch (err) {
         throw new Error(
-          `Failed to create output directory "${dir}": ${err instanceof Error ? err.message : String(err)}`
+          `Failed to create output directory "${dir}": ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err }
         );
       }
     }
