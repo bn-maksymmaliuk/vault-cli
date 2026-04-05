@@ -16,7 +16,7 @@
   "scripts": {
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "build": "tsup src/cli.ts src/action.ts --format cjs",
+    "build": "tsup",
     "release": "semantic-release",
     "prepublishOnly": "yarn build",
     "prepare": "husky install"
