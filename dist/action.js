@@ -74,12 +74,12 @@ async function exchangeGithubToken(addr, githubToken) {
       } else if (err.message) {
         errorMessage += `: ${err.message}`;
       }
-      throw new Error(errorMessage);
+      throw new Error(errorMessage, { cause: err });
     }
     if (err instanceof Error) {
-      throw new Error(`GitHub auth failed: ${err.message}`);
+      throw new Error(`GitHub auth failed: ${err.message}`, { cause: err });
     }
-    throw new Error("GitHub auth failed: unknown error");
+    throw new Error("GitHub auth failed: unknown error", { cause: err });
   }
 }
 
@@ -93,7 +93,8 @@ function validateVaultUrl(url) {
     }
   } catch (err) {
     throw new Error(
-      `Invalid VAULT_ADDR: "${url}" - ${err instanceof Error ? err.message : "Invalid URL format"}`
+      `Invalid VAULT_ADDR: "${url}" - ${err instanceof Error ? err.message : "Invalid URL format"}`,
+      { cause: err }
     );
   }
 }
@@ -185,7 +186,6 @@ var VaultClient = class {
   constructor(addr, token) {
     this.addr = addr;
     this.token = token;
-    this.kvVersionCache = /* @__PURE__ */ new Map();
     this.client = import_axios2.default.create({
       baseURL: `${addr}/v1`,
       headers: {
@@ -193,9 +193,13 @@ var VaultClient = class {
       }
     });
   }
+  client;
+  kvVersionCache = /* @__PURE__ */ new Map();
   /**
-   * Determines KV version by probing the mount path metadata
-   * Tries both KV v1 and KV v2 patterns to detect the version
+   * Determines KV version via sys/mounts API.
+   * Falls back to probing both KV versions if sys/mounts is not accessible (403).
+   *
+   * mountPath — first segment of the secret path, e.g. "projects" or "infrastructure"
    */
   async detectKVVersion(mountPath) {
     const cached = this.kvVersionCache.get(mountPath);
@@ -203,94 +207,93 @@ var VaultClient = class {
       return cached;
     }
     try {
-      const metadataPath = `${mountPath}/metadata`;
-      try {
-        await this.client.get(metadataPath);
-        this.kvVersionCache.set(mountPath, "v2");
-        return "v2";
-      } catch (metadataErr) {
-        if (metadataErr?.response?.status === 404) {
-          this.kvVersionCache.set(mountPath, "v1");
-          return "v1";
-        }
-        this.kvVersionCache.set(mountPath, "v2");
-        return "v2";
-      }
-    } catch (err) {
-      this.kvVersionCache.set(mountPath, "v2");
-      return "v2";
+      const res = await this.client.get(`/sys/mounts/${mountPath}`);
+      const options = res.data?.options ?? res.data?.data?.options;
+      const version = options?.version;
+      const detected = version === "2" ? "v2" : "v1";
+      this.kvVersionCache.set(mountPath, detected);
+      return detected;
+    } catch {
     }
+    try {
+      const res = await this.client.get(`/sys/internal/ui/mounts/${mountPath}`);
+      const version = res.data?.data?.options?.version;
+      const detected = version === "2" ? "v2" : "v1";
+      this.kvVersionCache.set(mountPath, detected);
+      return detected;
+    } catch {
+    }
+    this.kvVersionCache.set(mountPath, "unknown");
+    return "unknown";
   }
   /**
-   * Extract mount path and key from secret path
-   * Examples:
-   *   - secret/data/projects/api/db_url -> mount: secret, key: db_url, path: projects/api
-   *   - kv/teams/backend/token -> mount: kv, key: token, path: teams/backend
+   * Build the actual API path for reading a secret based on KV version
+   * KV v2: mount/data/path/to/secret
+   * KV v1: mount/path/to/secret
    */
-  parsePath(path2) {
-    const parts = path2.split("/");
+  buildReadPath(secretPath, kvVersion) {
+    const parts = secretPath.split("/").filter(Boolean);
     if (parts.length < 2) {
       throw new Error(
-        `Invalid path format: "${path2}" - expected format: "mount/path/to/key" or "mount/data/path/to/key"`
+        `Invalid secret path format: "${secretPath}" - expected "mount/path/to/secret"`
       );
     }
     const mount = parts[0];
-    let basePath;
-    let key;
-    const dataIndex = parts.indexOf("data");
-    if (dataIndex > 0) {
-      basePath = parts.slice(0, dataIndex + 1).join("/");
-      const pathParts = parts.slice(dataIndex + 1);
-      key = pathParts.pop() || "";
-      basePath = [basePath, ...pathParts].join("/");
-    } else {
-      const pathParts = parts.slice(1);
-      key = pathParts.pop() || "";
-      basePath = mount + (pathParts.length > 0 ? "/" + pathParts.join("/") : "");
-    }
-    if (!key) {
-      throw new Error(`Invalid path format: "${path2}" - no key specified`);
-    }
-    return { mount, basePath, key };
+    const restPath = parts.slice(1).join("/");
+    return kvVersion === "v2" ? `${mount}/data/${restPath}` : `${mount}/${restPath}`;
   }
   /**
-   * Extract mount path from secret path (first component)
+   * Fetch secret supporting both KV v1 and KV v2.
+   * Input path format: mount/path/to/secret (without /data/)
+   * When KV version cannot be determined, tries v1 then v2 automatically.
    */
-  extractMount(path2) {
-    const parts = path2.split("/");
-    return parts[0];
-  }
-  /**
-   * Extract mount and basePath from secret path (for getSecret with separate key)
-   */
-  parsePathForSecret(path2) {
-    const parts = path2.split("/");
-    const mount = parts[0];
-    const basePath = path2;
-    return { mount, basePath };
-  }
-  /**
-   * Fetch secret supporting both KV v1 and KV v2
-   */
-  async getSecret(path2, key) {
+  async getSecret(secretPath, key) {
     try {
-      const { mount, basePath } = this.parsePathForSecret(path2);
+      const mount = secretPath.split("/")[0];
+      if (!mount) {
+        throw new Error(`Invalid secret path: "${secretPath}"`);
+      }
       const kvVersion = await this.detectKVVersion(mount);
-      let value;
-      if (kvVersion === "v2") {
-        value = await this.getSecretV2(basePath, key);
-      } else {
-        value = await this.getSecretV1(basePath, key);
+      if (kvVersion === "v1" || kvVersion === "v2") {
+        const readPath = this.buildReadPath(secretPath, kvVersion);
+        const value = kvVersion === "v2" ? await this.getSecretV2(readPath, key) : await this.getSecretV1(readPath, key);
+        if (typeof value !== "string") {
+          throw new Error(
+            `Key "${key}" value is not a string at path: ${secretPath} (got ${typeof value})`
+          );
+        }
+        this.kvVersionCache.set(mount, kvVersion);
+        return value;
       }
-      if (typeof value !== "string") {
-        throw new Error(
-          `Key "${key}" value is not a string at path: ${basePath} (got ${typeof value})`
-        );
+      const v1Path = this.buildReadPath(secretPath, "v1");
+      try {
+        const value = await this.getSecretV1(v1Path, key);
+        if (typeof value !== "string") {
+          throw new Error(
+            `Key "${key}" value is not a string at path: ${secretPath} (got ${typeof value})`
+          );
+        }
+        this.kvVersionCache.set(mount, "v1");
+        return value;
+      } catch (v1Err) {
+        const v2Path = this.buildReadPath(secretPath, "v2");
+        try {
+          const value = await this.getSecretV2(v2Path, key);
+          if (typeof value !== "string") {
+            throw new Error(
+              `Key "${key}" value is not a string at path: ${secretPath} (got ${typeof value})`,
+              { cause: v1Err }
+            );
+          }
+          this.kvVersionCache.set(mount, "v2");
+          return value;
+        } catch (v2Err) {
+          throw v1Err;
+        }
       }
-      return value;
     } catch (err) {
       if (err instanceof Error) {
-        throw new Error(`Failed to fetch secret "${path2}" with key "${key}": ${err.message}`);
+        throw new Error(`Failed to fetch secret "${secretPath}" with key "${key}": ${err.message}`, { cause: err });
       }
       throw err;
     }
@@ -313,10 +316,10 @@ var VaultClient = class {
     } catch (err) {
       if (import_axios2.default.isAxiosError(err)) {
         if (err.response?.status === 404) {
-          throw new Error(`Secret not found at path: ${basePath}`);
+          throw new Error(`Secret not found at path: ${basePath}`, { cause: err });
         }
         if (err.response?.status === 403) {
-          throw new Error(`Permission denied accessing: ${basePath}`);
+          throw new Error(`Permission denied accessing: ${basePath}`, { cause: err });
         }
       }
       throw err;
@@ -340,10 +343,10 @@ var VaultClient = class {
     } catch (err) {
       if (import_axios2.default.isAxiosError(err)) {
         if (err.response?.status === 404) {
-          throw new Error(`Secret not found at path: ${basePath}`);
+          throw new Error(`Secret not found at path: ${basePath}`, { cause: err });
         }
         if (err.response?.status === 403) {
-          throw new Error(`Permission denied accessing: ${basePath}`);
+          throw new Error(`Permission denied accessing: ${basePath}`, { cause: err });
         }
       }
       throw err;
@@ -357,6 +360,67 @@ var VaultClient = class {
   }
 };
 
+// src/core/logger.ts
+var import_chalk = __toESM(require("chalk"));
+var import_ora = __toESM(require("ora"));
+var log = {
+  /** Header banner */
+  banner() {
+    console.log();
+    console.log(import_chalk.default.hex("#FFD700").bold("  \u25C6 vault-cli"));
+    console.log(import_chalk.default.dim("  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"));
+  },
+  /** Key-value info line */
+  info(label, value) {
+    console.log(`  ${import_chalk.default.dim(label + ":")} ${import_chalk.default.cyan(value)}`);
+  },
+  /** Verbose debug line */
+  verbose(msg) {
+    console.log(`  ${import_chalk.default.dim("\u203A")} ${import_chalk.default.gray(msg)}`);
+  },
+  /** Section divider */
+  divider() {
+    console.log(import_chalk.default.dim("  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"));
+  },
+  /** Success message */
+  success(msg) {
+    console.log();
+    console.log(`  ${import_chalk.default.green("\u2714")} ${import_chalk.default.green(msg)}`);
+    console.log();
+  },
+  /** Error message */
+  error(msg) {
+    console.log();
+    console.log(`  ${import_chalk.default.red("\u2716")} ${import_chalk.default.red(msg)}`);
+    console.log();
+  },
+  /** Warning message */
+  warn(msg) {
+    console.log(`  ${import_chalk.default.yellow("\u26A0")} ${import_chalk.default.yellow(msg)}`);
+  },
+  /** Start a spinner — available for future use */
+  spinner(text) {
+    return (0, import_ora.default)({
+      text: import_chalk.default.dim(text),
+      prefixText: "  ",
+      color: "yellow"
+    }).start();
+  },
+  /** Per-secret success line */
+  secretOk(key, path2) {
+    console.log(
+      `  ${import_chalk.default.green("\u2714")} ${import_chalk.default.white(key.padEnd(24))} ${import_chalk.default.dim("\u2190")} ${import_chalk.default.dim(path2)}`
+    );
+  },
+  /** Per-secret failure line */
+  secretFail(key, path2, reason) {
+    console.log(
+      `  ${import_chalk.default.red("\u2716")} ${import_chalk.default.white(key.padEnd(24))} ${import_chalk.default.dim("\u2190")} ${import_chalk.default.dim(path2)}`
+    );
+    console.log(`    ${import_chalk.default.red(reason)}`);
+  }
+};
+
 // src/core/generator.ts
 async function generateEnv(options) {
   const { templatePath, outputPath, vaultAddr, vaultToken, verbose } = options;
@@ -366,53 +430,40 @@ async function generateEnv(options) {
   const template = import_fs.default.readFileSync(templatePath, "utf-8");
   const entries = parseTemplate(template);
   const client = new VaultClient(vaultAddr, vaultToken);
-  const uniqueMounts = /* @__PURE__ */ new Set();
-  const detectedVersions = /* @__PURE__ */ new Map();
   if (verbose) {
-    for (const entry of entries) {
-      const mount = entry.path.split("/")[0];
-      uniqueMounts.add(mount);
-    }
+    log.divider();
+    const uniqueMounts = [...new Set(entries.map((e) => e.path.split("/")[0]))];
     for (const mount of uniqueMounts) {
       try {
         const version = await client.getKVVersion(mount);
-        detectedVersions.set(mount, version);
-        console.log(`[VERBOSE] Mount "${mount}": KV ${version}`);
-      } catch (err) {
-        console.log(`[VERBOSE] Mount "${mount}": version detection failed, will auto-detect per secret`);
+        log.verbose(`Mount "${mount}": KV ${version}`);
+      } catch {
+        log.verbose(`Mount "${mount}": version detection failed, will auto-detect`);
       }
     }
   }
+  log.divider();
   const limit = (0, import_p_limit.default)(5);
+  const errors = [];
   const results = await Promise.all(
     entries.map(
       (entry) => limit(async () => {
         try {
           const value = await client.getSecret(entry.path, entry.key);
+          log.secretOk(entry.key, entry.path);
           return `${entry.key}=${value}`;
         } catch (err) {
           const errorMsg = err instanceof Error ? err.message : String(err);
-          throw new Error(`Failed to load secret for key "${entry.key}": ${errorMsg}`);
+          const fullMsg = `Failed to load secret for key "${entry.key}": ${errorMsg}`;
+          log.secretFail(entry.key, entry.path, errorMsg);
+          errors.push(fullMsg);
+          throw new Error(fullMsg, { cause: err });
         }
       })
     )
   );
   const envContent = results.join("\n") + "\n";
   import_fs.default.writeFileSync(outputPath, envContent);
-}
-
-// src/core/env.ts
-function resolveEnv() {
-  if (process.env.GITHUB_ACTIONS === "true") {
-    if (process.env.GITHUB_REF_TYPE === "tag") {
-      return "production";
-    }
-    if (process.env.GITHUB_REF_NAME === process.env.GITHUB_DEFAULT_BRANCH) {
-      return "staging";
-    }
-    return "development";
-  }
-  return "development";
 }
 
 // src/action.ts
@@ -424,12 +475,13 @@ async function run() {
     const githubToken = (0, import_core.getInput)("github-token");
     const templateInput = (0, import_core.getInput)("template");
     const outputInput = (0, import_core.getInput)("output") ?? ".env";
-    const env = resolveEnv();
-    const templateName = templateInput || `.env.${env}.tpl`;
     if (!vaultAddr) {
       throw new Error("Input 'addr' is required");
     }
-    const templatePath = import_path.default.resolve(workspaceDir, templateName);
+    if (!templateInput) {
+      throw new Error("Input 'template' is required");
+    }
+    const templatePath = import_path.default.resolve(workspaceDir, templateInput);
     const outputPath = import_path.default.resolve(workspaceDir, outputInput);
     if (!import_fs2.default.existsSync(templatePath)) {
       throw new Error(`Template not found at: ${templatePath}`);
